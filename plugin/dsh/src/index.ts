@@ -37,7 +37,7 @@ interface PluginLogger {
 
 export interface PluginContext {
   on(event: string, listener: AnyListener): void;
-  effect(callback: () => void | (() => void), label?: string): void;
+  effect(callback: () => void | (() => void | Promise<void>), label?: string): void;
   logger: PluginLogger;
 }
 
@@ -112,10 +112,10 @@ const SESSION_END_TIMEOUT_MS = 30000;
 const INSTRUCTIONS = [
   "<agentmemory-instructions>",
   "You have persistent cross-session long-term memory via agentmemory. Tools are namespaced `mcp__agentmemory__*` (memory_recall / memory_save / memory_smart_search / memory_sessions / ...).",
-  "- At the START of a task, call `mcp__agentmemory__memory_recall` (or `memory_smart_search`) to load relevant past decisions, fixes, and user preferences; do not re-ask.",
+  "- At the START of a task, call `mcp__agentmemory__memory_recall` (or `mcp__agentmemory__memory_smart_search`) to load relevant past decisions, fixes, and user preferences; do not re-ask.",
   "- When you learn something durable (a decision, a fix, a gotcha, a preference, a project convention), call `mcp__agentmemory__memory_save` (concepts: 2-5 comma-separated keywords).",
   "- Prefer recall over re-deriving; save concise reusable facts, not transcripts.",
-  "- If the user asks to forget/delete something, use `memory_governance_delete` (comma-separated memoryIds).",
+  "- If the user asks to forget/delete something, use `mcp__agentmemory__memory_governance_delete` (comma-separated memoryIds).",
   "- Tool results are JSON — inspect them before presenting to the user.",
   "</agentmemory-instructions>",
 ].join("\n");
@@ -203,6 +203,7 @@ export function eventTextContent(content: unknown): string {
 
 export function userMessagePrompt(event: SessionEvent, maxChars: number): string | null {
   if (event.type !== "user/message") return null;
+  if (event.data?.source?.kind && event.data.source.kind !== "user") return null;
   const text = eventTextContent(event.data?.content);
   if (!text.trim()) return null;
   return text.slice(0, maxChars);
@@ -215,7 +216,7 @@ export function toolCallObservation(event: SessionEvent, maxChars: number): Reco
   if (!name || isAgentmemoryTool(name)) return null;
   let input: string;
   try {
-    input = JSON.stringify(data.arguments ?? {}).slice(0, maxChars);
+    input = (typeof data.arguments === "string" ? data.arguments : JSON.stringify(data.arguments ?? {})).slice(0, maxChars);
   } catch {
     input = String(data.arguments ?? "").slice(0, maxChars);
   }
@@ -226,9 +227,9 @@ export function compactionSummary(event: SessionEvent, maxChars: number): string
   if (event.type !== "compaction/summary") return null;
   const data = event.data ?? {};
   const summary =
-    (typeof data.summary === "string" && data.summary ? data.summary : undefined) ??
-    (typeof data.text === "string" && data.text ? data.text : undefined) ??
-    (typeof data.content === "string" && data.content ? data.content : undefined);
+    eventTextContent(data.summary) ||
+    eventTextContent(data.text) ||
+    eventTextContent(data.content);
   if (!summary) return null;
   return summary.slice(0, maxChars);
 }
@@ -346,6 +347,17 @@ export function apply(ctx: PluginContext, rawConfig: Partial<AgentmemoryConfig> 
       return;
     }
 
+    if (event.type === "approval/asked") {
+      const data = event.data ?? {};
+      fireObserve(sid, info, "notification", {
+        notification_type: "permission_prompt",
+        tool_name: typeof data.toolName === "string" ? data.toolName.slice(0, 2000) : "",
+        call_id: typeof data.callId === "string" ? data.callId.slice(0, 2000) : null,
+        reason: typeof data.reason === "string" ? data.reason.slice(0, 2000) : "",
+      });
+      return;
+    }
+
     if (cfg.compactionBridge) {
       const summary = compactionSummary(event, COMPACTION_MAX_CHARS);
       if (summary !== null) {
@@ -459,12 +471,14 @@ export function apply(ctx: PluginContext, rawConfig: Partial<AgentmemoryConfig> 
     sessionInfos.delete(sid);
   });
 
-  // Dispose bookkeeping on plugin teardown. In-flight REST calls (including
-  // /session/end summarization) stay referenced in pendingCalls — never cleared
-  // here — and Node's event loop keeps the process alive until their sockets
-  // settle, so a normal host shutdown does not drop them. Only a forced
-  // process.exit() could cut them off; cordis disposes plugins before exiting.
-  ctx.effect(() => () => {
+  // Cordis can remove this plugin's listeners before disposing live sessions.
+  ctx.effect(() => async () => {
+    await Promise.allSettled([...pendingCalls]);
+    if (cfg.summarizeOnDispose) {
+      await Promise.allSettled([...sessionInfos.keys()].map(sessionId =>
+        rest.post("/session/end", { sessionId }, SESSION_END_TIMEOUT_MS),
+      ));
+    }
     startContextCache.clear();
     injectedSessions.clear();
     sessionInfos.clear();

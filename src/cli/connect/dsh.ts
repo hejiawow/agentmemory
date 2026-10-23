@@ -153,7 +153,7 @@ export const adapter: ConnectAdapter = {
 
     if (alreadyHas && !opts.force) {
       logAlreadyWired(this.displayName, patch);
-      ensureSkill(false);
+      if (!opts.dryRun) ensureSkill(false);
       return { kind: "already-wired", mutatedPath: patch };
     }
 

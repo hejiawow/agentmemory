@@ -39,6 +39,7 @@ const L1 = [
   "        env:",
   // single-quote the URL in YAML and double any embedded single quotes
   "          AGENTMEMORY_URL: '" + String(url).replace(/'/g, "''") + "'",
+  "          AGENTMEMORY_SECRET: !!js process.env.AGENTMEMORY_SECRET || ''",
   "        toolCallTimeoutMs: 60000",
   "        failOnStartupError: false",
   "",
@@ -105,8 +106,12 @@ if (fs.existsSync(agentsFile) && fs.readFileSync(agentsFile, "utf8").includes("a
 
 step("3/4 memory skill -> " + skillDir);
 fs.mkdirSync(skillDir, { recursive: true });
-fs.writeFileSync(path.join(skillDir, "SKILL.md"), SKILL_MD, "utf8");
-console.log("  written (dsh-skill-filesystem scans <dshHome>/skills)");
+if (fs.existsSync(path.join(skillDir, "SKILL.md"))) {
+  console.log("  skill already present (preserved)");
+} else {
+  fs.writeFileSync(path.join(skillDir, "SKILL.md"), SKILL_MD, "utf8");
+  console.log("  written (dsh-skill-filesystem scans <dshHome>/skills)");
+}
 
 if (WITH_PLUGIN) {
   step("4/4 plugin @agentmemory/dsh -> " + profilePkg);
@@ -131,17 +136,18 @@ if (WITH_PLUGIN) {
     console.log("  package.json now declares file:" + pluginDir);
   }
   const cur = fs.readFileSync(patch, "utf8");
-  if (cur.includes("id: agentmemory") && cur.includes("@agentmemory/dsh")) {
-    console.log("  plugin entry already present (skipped)");
+  if (/^\s+name:\s*['"]?@agentmemory\/dsh['"]?\s*$/m.test(cur)) {
+    console.log("  plugin entry already present (skipped); use id: agentmemory-capture. Rename an older native id: agentmemory to avoid an MCP collision.");
   } else {
     const L3 = [
       "",
       "# ── agentmemory L3: cordis plugin (applied by dsh-install.cjs) ──",
       "- insert:",
-      "    - id: agentmemory",
+      "    - id: agentmemory-capture",
       "      name: '@agentmemory/dsh'",
       "      config:",
       "        url: '" + String(url).replace(/'/g, "''") + "'",
+      "        secret: !!js process.env.AGENTMEMORY_SECRET || ''",
       "        agentId: dsh",
       "",
     ].join("\n");

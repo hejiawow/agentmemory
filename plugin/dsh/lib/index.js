@@ -24,10 +24,10 @@ const SESSION_END_TIMEOUT_MS = 3e4;
 const INSTRUCTIONS = [
 	"<agentmemory-instructions>",
 	"You have persistent cross-session long-term memory via agentmemory. Tools are namespaced `mcp__agentmemory__*` (memory_recall / memory_save / memory_smart_search / memory_sessions / ...).",
-	"- At the START of a task, call `mcp__agentmemory__memory_recall` (or `memory_smart_search`) to load relevant past decisions, fixes, and user preferences; do not re-ask.",
+	"- At the START of a task, call `mcp__agentmemory__memory_recall` (or `mcp__agentmemory__memory_smart_search`) to load relevant past decisions, fixes, and user preferences; do not re-ask.",
 	"- When you learn something durable (a decision, a fix, a gotcha, a preference, a project convention), call `mcp__agentmemory__memory_save` (concepts: 2-5 comma-separated keywords).",
 	"- Prefer recall over re-deriving; save concise reusable facts, not transcripts.",
-	"- If the user asks to forget/delete something, use `memory_governance_delete` (comma-separated memoryIds).",
+	"- If the user asks to forget/delete something, use `mcp__agentmemory__memory_governance_delete` (comma-separated memoryIds).",
 	"- Tool results are JSON — inspect them before presenting to the user.",
 	"</agentmemory-instructions>"
 ].join("\n");
@@ -94,6 +94,7 @@ function eventTextContent(content) {
 }
 function userMessagePrompt(event, maxChars) {
 	if (event.type !== "user/message") return null;
+	if (event.data?.source?.kind && event.data.source.kind !== "user") return null;
 	const text = eventTextContent(event.data?.content);
 	if (!text.trim()) return null;
 	return text.slice(0, maxChars);
@@ -105,7 +106,7 @@ function toolCallObservation(event, maxChars) {
 	if (!name || isAgentmemoryTool(name)) return null;
 	let input;
 	try {
-		input = JSON.stringify(data.arguments ?? {}).slice(0, maxChars);
+		input = (typeof data.arguments === "string" ? data.arguments : JSON.stringify(data.arguments ?? {})).slice(0, maxChars);
 	} catch {
 		input = String(data.arguments ?? "").slice(0, maxChars);
 	}
@@ -118,7 +119,7 @@ function toolCallObservation(event, maxChars) {
 function compactionSummary(event, maxChars) {
 	if (event.type !== "compaction/summary") return null;
 	const data = event.data ?? {};
-	const summary = (typeof data.summary === "string" && data.summary ? data.summary : void 0) ?? (typeof data.text === "string" && data.text ? data.text : void 0) ?? (typeof data.content === "string" && data.content ? data.content : void 0);
+	const summary = eventTextContent(data.summary) || eventTextContent(data.text) || eventTextContent(data.content);
 	if (!summary) return null;
 	return summary.slice(0, maxChars);
 }
@@ -203,6 +204,16 @@ function apply(ctx, rawConfig = {}) {
 		const tool = toolCallObservation(event, TOOL_INPUT_MAX_CHARS);
 		if (tool !== null && cfg.observeToolCalls) {
 			fireObserve(sid, info, "post_tool_use", tool);
+			return;
+		}
+		if (event.type === "approval/asked") {
+			const data = event.data ?? {};
+			fireObserve(sid, info, "notification", {
+				notification_type: "permission_prompt",
+				tool_name: typeof data.toolName === "string" ? data.toolName.slice(0, 2e3) : "",
+				call_id: typeof data.callId === "string" ? data.callId.slice(0, 2e3) : null,
+				reason: typeof data.reason === "string" ? data.reason.slice(0, 2e3) : ""
+			});
 			return;
 		}
 		if (cfg.compactionBridge) {
@@ -304,7 +315,9 @@ function apply(ctx, rawConfig = {}) {
 		injectedSessions.delete(sid);
 		sessionInfos.delete(sid);
 	});
-	ctx.effect(() => () => {
+	ctx.effect(() => async () => {
+		await Promise.allSettled([...pendingCalls]);
+		if (cfg.summarizeOnDispose) await Promise.allSettled([...sessionInfos.keys()].map((sessionId) => rest.post("/session/end", { sessionId }, SESSION_END_TIMEOUT_MS)));
 		startContextCache.clear();
 		injectedSessions.clear();
 		sessionInfos.clear();

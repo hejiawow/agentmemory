@@ -21,23 +21,29 @@ function jsonResponse(body: unknown, ok = true): Response {
   return new Response(JSON.stringify(body), { status: ok ? 200 : 500, headers: { "Content-Type": "application/json" } });
 }
 
-function makeCtx(): { ctx: PluginContext; listeners: Map<string, Function[]>; logs: string[] } {
+function makeCtx() {
   const listeners = new Map<string, Function[]>();
   const logs: string[] = [];
+  const disposers: Array<() => unknown> = [];
   const ctx: PluginContext = {
     on(event, listener) {
       const arr = listeners.get(event) ?? [];
       arr.push(listener);
       listeners.set(event, arr);
     },
-    effect() {},
+    effect(callback) {
+      const dispose = callback();
+      if (dispose) disposers.push(dispose);
+    },
     logger: {
       info: (...a) => logs.push("info " + a.join(" ")),
       warn: (...a) => logs.push("warn " + a.join(" ")),
       error: (...a) => logs.push("error " + a.join(" ")),
     },
   };
-  return { ctx, listeners, logs };
+  return { ctx, listeners, logs, dispose: async () => {
+    for (const dispose of disposers) await dispose();
+  } };
 }
 
 async function fire(listeners: Map<string, Function[]>, event: string, ...args: unknown[]) {
@@ -131,6 +137,17 @@ describe("event mapping", () => {
     expect(userMessagePrompt(event("tool/call", {}), 100)).toBeNull();
   });
 
+  it("does not recapture injected context as a human prompt", () => {
+    for (const kind of ["agentmemory", "runtime-context", "compaction"]) {
+      expect(userMessagePrompt(event("user/message", {
+        content: [{ type: "text", text: "Private recalled context" }], source: { kind },
+      }), 100)).toBeNull();
+    }
+    expect(userMessagePrompt(event("user/message", {
+      content: "Human request", source: { kind: "user" },
+    }), 100)).toBe("Human request");
+  });
+
   it("toolCallObservation extracts name and arguments and truncates", () => {
     const e = event("tool/call", { callId: "c1", name: "read", arguments: { path: "/a/b.txt" } });
     const obs = toolCallObservation(e, 200);
@@ -145,9 +162,22 @@ describe("event mapping", () => {
     expect(toolCallObservation(e, 200)).toBeNull();
   });
 
+  it("keeps real Harness JSON tool arguments without double encoding", () => {
+    const args = '{"path":"/fixture/cobalt.txt"}';
+    expect(toolCallObservation(event("tool/call", {
+      name: "read", callId: "read-1", arguments: args,
+    }), 200)?.tool_input).toBe(args);
+  });
+
   it("compactionSummary extracts summary text", () => {
     expect(compactionSummary(event("compaction/summary", { summary: "did stuff" }), 100)).toBe("did stuff");
     expect(compactionSummary(event("user/message", {}), 100)).toBeNull();
+  });
+
+  it("extracts the real Harness compaction content blocks", () => {
+    expect(compactionSummary(event("compaction/summary", {
+      summary: [{ type: "text", text: "Keep cobalt settings." }],
+    }), 100)).toBe("Keep cobalt settings.");
   });
 });
 
@@ -254,6 +284,23 @@ describe("plugin apply()", () => {
     expect(String(body.content)).toContain("refactored auth module");
   });
 
+  it("observes real Harness approval events from the session stream", async () => {
+    const bodies: any[] = [];
+    fakeFetch(async (_url, init) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return jsonResponse({});
+    });
+    const { ctx, listeners } = makeCtx();
+    apply(ctx);
+    await fire(listeners, "session/event", session("approval-session"), event("approval/asked", {
+      id: "approval-1", toolName: "bash", callId: "call-1", reason: "Confirm operation",
+    }));
+    expect(bodies).toEqual([expect.objectContaining({
+      sessionId: "approval-session", hookType: "notification",
+      data: expect.objectContaining({ tool_name: "bash", call_id: "call-1" }),
+    })]);
+  });
+
   it("calls session/end on dispose", async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     fakeFetch(async (url, init) => {
@@ -269,6 +316,28 @@ describe("plugin apply()", () => {
     const ends = calls.filter((c) => c.url.endsWith("/session/end"));
     expect(ends).toHaveLength(1);
     expect(JSON.parse(String(ends[0].init.body))).toEqual({ sessionId: "ses_5" });
+  });
+
+  it("ends live sessions and waits for requests before host teardown returns", async () => {
+    let releaseEnd!: () => void;
+    const ended = new Promise<void>(resolve => { releaseEnd = resolve; });
+    const paths: string[] = [];
+    fakeFetch(async (url) => {
+      paths.push(url);
+      if (url.endsWith("/session/end")) await ended;
+      return jsonResponse({});
+    });
+    const { ctx, listeners, dispose } = makeCtx();
+    apply(ctx);
+    await fire(listeners, "session/created", session("shutdown-session"));
+    let disposed = false;
+    const pending = dispose().then(() => { disposed = true; });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(paths.some(path => path.endsWith("/session/end"))).toBe(true);
+    expect(disposed).toBe(false);
+    releaseEnd();
+    await pending;
+    expect(disposed).toBe(true);
   });
 
   it("never throws when daemon is unreachable", async () => {

@@ -122,6 +122,15 @@ describe("agentmemory connect — dsh adapter", () => {
     expect(existsSync(patch)).toBe(false);
   });
 
+  it("dry-run does not restore a missing skill for an existing MCP entry", async () => {
+    makeProfile();
+    await adapter.install(OPTS);
+    const skill = join(tmpHome, ".dsh", "skills", "agentmemory-sync");
+    rmSync(skill, { recursive: true });
+    await adapter.install({ ...OPTS, dryRun: true });
+    expect(existsSync(skill)).toBe(false);
+  });
+
   it("returns stub when profile dir is missing", async () => {
     mkdirSync(join(tmpHome, ".dsh"), { recursive: true });
     const result = await adapter.install(OPTS);

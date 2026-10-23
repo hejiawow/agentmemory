@@ -1,22 +1,27 @@
-export interface PluginContext {
-  on(event: string, listener: (...args: any[]) => unknown): void;
-  effect(callback: () => void | (() => void), label?: string): void;
-  logger: { info(...args: unknown[]): void; warn(...args: unknown[]): void; error(...args: unknown[]): void };
+//#region src/index.d.ts
+type AnyListener = (...args: any[]) => unknown;
+interface PluginLogger {
+  info(...args: unknown[]): void;
+  warn(...args: unknown[]): void;
+  error(...args: unknown[]): void;
 }
-
-export interface SessionLike {
+interface PluginContext {
+  on(event: string, listener: AnyListener): void;
+  effect(callback: () => void | (() => void | Promise<void>), label?: string): void;
+  logger: PluginLogger;
+}
+interface SessionLike {
   id: string;
-  header?: { cwd?: string };
+  header?: {
+    cwd?: string;
+  };
 }
-
-// Event payloads vary by event type; consumers narrow data at runtime.
-export interface SessionEvent {
+interface SessionEvent {
   type: string;
   seq?: number;
   data: any;
 }
-
-export interface AgentmemoryConfig {
+interface AgentmemoryConfig {
   url: string;
   secret: string;
   agentId: string;
@@ -27,19 +32,18 @@ export interface AgentmemoryConfig {
   compactionBridge: boolean;
   summarizeOnDispose: boolean;
 }
-
-export interface RestClient {
+interface RestClient {
   post<T>(path: string, body: Record<string, unknown>, timeoutMs?: number): Promise<T | null>;
   fire(path: string, body: Record<string, unknown>, timeoutMs?: number): void;
 }
-
-export function makeRestClient(url: string, secret: string, debug?: boolean): RestClient;
-export function resolveProjectName(cwd: string, env?: Record<string, string | undefined>): string;
-export function isAgentmemoryTool(name: string): boolean;
-export function eventTextContent(content: unknown): string;
-export function userMessagePrompt(event: SessionEvent, maxChars: number): string | null;
-export function toolCallObservation(event: SessionEvent, maxChars: number): Record<string, unknown> | null;
-export function compactionSummary(event: SessionEvent, maxChars: number): string | null;
-
-export const name: string;
-export function apply(ctx: PluginContext, config?: Partial<AgentmemoryConfig>): void;
+declare function makeRestClient(url: string, secret: string, debug?: boolean): RestClient;
+declare function resolveProjectName(cwd: string, env?: Record<string, string | undefined>): string;
+declare function isAgentmemoryTool(name: string): boolean;
+declare function eventTextContent(content: unknown): string;
+declare function userMessagePrompt(event: SessionEvent, maxChars: number): string | null;
+declare function toolCallObservation(event: SessionEvent, maxChars: number): Record<string, unknown> | null;
+declare function compactionSummary(event: SessionEvent, maxChars: number): string | null;
+declare const name = "agentmemory";
+declare function apply(ctx: PluginContext, rawConfig?: Partial<AgentmemoryConfig>): void;
+//#endregion
+export { AgentmemoryConfig, PluginContext, RestClient, SessionEvent, SessionLike, apply, compactionSummary, eventTextContent, isAgentmemoryTool, makeRestClient, name, resolveProjectName, toolCallObservation, userMessagePrompt };
