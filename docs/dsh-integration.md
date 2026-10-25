@@ -8,8 +8,8 @@ dsh (DeepSeek Harness) is a cordis-based agent harness with no long-term memory:
 
 | Layer | What | Where |
 |---|---|---|
-| L1 MCP bridge | `mcp__agentmemory__*` tools via `@deepseek-ai/dsh-mcp-client` (stdio → `@agentmemory/mcp` shim, proxies to the daemon; reduced local fallback when unreachable) | `~/.dsh/profiles/<p>/cordis.patch.yml` entry, written by `agentmemory connect dsh` |
-| L2 Behavior guidance | memory-usage guideline injected into every session (`~/.dsh/AGENTS.md`, read by dsh-agent-instructions) + `agentmemory-sync` skill (`~/.dsh/skills/`) | `src/cli/connect/guidelines.ts` + adapter |
+| L1 MCP bridge | `mcp__agentmemory__*` tools via `@deepseek-ai/dsh-mcp-client` (stdio → `@agentmemory/mcp` shim, proxies to the daemon; reduced local fallback when unreachable) | `$DSH_HOME/cordis.patch.yml` entry, written by `agentmemory connect dsh` |
+| L2 Behavior guidance | memory-usage guideline injected into every session (`~/.dsh/AGENTS.md`, read by dsh-agent-instructions) + `agentmemory-sync` skill (`~/.dsh/skills/`) | `agentmemory connect dsh --guidelines`; optional skill copied from `plugin/dsh/install/skills/` |
 | L3 Auto-capture plugin | `@agentmemory/dsh` cordis plugin: session lifecycle → REST | `plugin/dsh/` |
 | L4 Deep collaboration | per-agent isolation (`agentId`), compaction bridge, team memory | plugin config / future |
 
@@ -49,7 +49,3 @@ Start a new session, save a distinctive fact using `mcp__agentmemory__memory_sav
 The native plugin was exercised in the real Harness CLI with a local scripted model endpoint and real AgentMemory daemons on iii 0.22 and 0.24.6. Checks covered MCP save/recall, first-step injection, prompt capture, approval events, compaction persistence, and normal process shutdown. Model inference was scripted; the host, Cordis lifecycle, MCP transport, and daemon were real.
 
 Run `npm test`, `npm run typecheck`, and `npm run build` from `plugin/dsh`. The generated package must contain `lib/index.js` and `lib/index.d.ts`; install the packed archive for a final host smoke test.
-
-## Installer
-
-`scripts/dsh-install.cjs` applies L1+L2 and declares the L3 plugin dependency idempotently (`--dry-run` preview, `--no-plugin` for config-only).

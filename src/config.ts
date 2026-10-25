@@ -17,10 +17,25 @@ function safeParseInt(value: string | undefined, fallback: number): number {
   return Number.isNaN(parsed) ? fallback : parsed;
 }
 
+// Import-side ceiling for observations in a single session (enforced by
+// mem::import). Deliberately NOT named MAX_OBS_PER_SESSION — that env var is
+// the runtime write cap and the two are independent; loadConfig() warns when
+// the runtime cap is raised past this ceiling, which would let a session grow
+// past the point where export→import round-trips can restore the store.
+export const MAX_IMPORT_OBS_PER_SESSION = 5_000;
+
 const DATA_DIR = join(homedir(), ".agentmemory");
 const ENV_FILE = join(DATA_DIR, ".env");
 
 let warnPremiumModelShown = false;
+let providerNoticeShown = false;
+let obsCapImportCeilingWarned = false;
+
+function writeProviderNoticeOnce(text: string): void {
+  if (providerNoticeShown) return;
+  providerNoticeShown = true;
+  process.stderr.write(text);
+}
 
 // Parsed ~/.agentmemory/.env, memoized for the process lifetime. getMergedEnv()
 // runs on every config getter (~20 of them), so without this cache a single
@@ -83,14 +98,40 @@ export function hydrateProcessEnvFromFile(): void {
   }
 }
 
+// Warn once when a configured model is in the premium tier and likely to burn
+// money on background compression. Captured workload data shows ~$5/35h on
+// claude-sonnet-4 vs ~$0.46/35h on deepseek-v4-pro for the same compression
+// mix. Heuristic match avoids hard-coding a pricing table.
+function warnIfPremiumModel(env: Record<string, string>, envName: string, model: string): void {
+  if (
+    warnPremiumModelShown ||
+    !/sonnet|opus|gpt-5\.\d+-sol|gpt-4o(?!.*mini)|gpt-4-turbo/i.test(model) ||
+    env["AGENTMEMORY_SUPPRESS_COST_WARNING"] === "1" ||
+    env["AGENTMEMORY_SUPPRESS_COST_WARNING"] === "true"
+  ) {
+    return;
+  }
+  warnPremiumModelShown = true;
+  process.stderr.write(
+    `[agentmemory] ${envName}=${model} is in the premium tier. ` +
+      `Background compression on this model can cost $5+/day under active use. ` +
+      `Cheaper alternatives with comparable quality for memory compression: ` +
+      `deepseek/deepseek-v4-flash-0731, deepseek/deepseek-v4-pro, qwen/qwen3-coder. ` +
+      `See README "Cost-aware model selection" for the full table. ` +
+      `Set AGENTMEMORY_SUPPRESS_COST_WARNING=1 to silence.\n`,
+  );
+}
+
 function detectProvider(env: Record<string, string>): ProviderConfig {
   const maxTokens = parseInt(env["MAX_TOKENS"] || "4096", 10);
 
   // OpenAI-compatible: supports OpenAI, DeepSeek, SiliconFlow, Azure, vLLM, LM Studio
   if (hasRealValue(env["OPENAI_API_KEY"]) && env["OPENAI_API_KEY_FOR_LLM"] !== "false") {
+    const model = env["OPENAI_MODEL"] || "gpt-5.6-luna";
+    warnIfPremiumModel(env, "OPENAI_MODEL", model);
     return {
       provider: "openai",
-      model: env["OPENAI_MODEL"] || "gpt-4o-mini",
+      model,
       maxTokens,
       baseURL: env["OPENAI_BASE_URL"],
     };
@@ -100,7 +141,7 @@ function detectProvider(env: Record<string, string>): ProviderConfig {
   if (hasRealValue(env["MINIMAX_API_KEY"])) {
     return {
       provider: "minimax",
-      model: env["MINIMAX_MODEL"] || "MiniMax-M2.7",
+      model: env["MINIMAX_MODEL"] || "MiniMax-M3",
       maxTokens,
     };
   }
@@ -108,7 +149,7 @@ function detectProvider(env: Record<string, string>): ProviderConfig {
   if (hasRealValue(env["ANTHROPIC_API_KEY"])) {
     return {
       provider: "anthropic",
-      model: env["ANTHROPIC_MODEL"] || "claude-sonnet-4-20250514",
+      model: env["ANTHROPIC_MODEL"] || "claude-sonnet-5",
       maxTokens,
       baseURL: env["ANTHROPIC_BASE_URL"],
     };
@@ -122,34 +163,13 @@ function detectProvider(env: Record<string, string>): ProviderConfig {
     }
     return {
       provider: "gemini",
-      model: env["GEMINI_MODEL"] || "gemini-2.5-flash",
+      model: env["GEMINI_MODEL"] || "gemini-3.7-flash",
       maxTokens,
     };
   }
   if (hasRealValue(env["OPENROUTER_API_KEY"])) {
-    const model =
-      env["OPENROUTER_MODEL"] || "anthropic/claude-sonnet-4-20250514";
-    // warn when the configured OpenRouter model is in the
-    // premium tier and likely to burn money on background compression.
-    // Captured workload data shows ~$5/35h on claude-sonnet-4 vs
-    // ~$0.46/35h on deepseek-v4-pro for the same compression mix.
-    // Heuristic match avoids hard-coding a pricing table.
-    if (
-      !warnPremiumModelShown &&
-      /sonnet|opus|gpt-4o(?!.*mini)|gpt-4-turbo/i.test(model) &&
-      env["AGENTMEMORY_SUPPRESS_COST_WARNING"] !== "1" &&
-      env["AGENTMEMORY_SUPPRESS_COST_WARNING"] !== "true"
-    ) {
-      warnPremiumModelShown = true;
-      process.stderr.write(
-        `[agentmemory] OPENROUTER_MODEL=${model} is in the premium tier. ` +
-          `Background compression on this model can cost $5+/day under active use. ` +
-          `Cheaper alternatives with comparable quality for memory compression: ` +
-          `deepseek/deepseek-v4-pro, deepseek/deepseek-chat, qwen/qwen3-coder. ` +
-          `See README "Cost-aware model selection" for the full table. ` +
-          `Set AGENTMEMORY_SUPPRESS_COST_WARNING=1 to silence.\n`,
-      );
-    }
+    const model = env["OPENROUTER_MODEL"] || "anthropic/claude-sonnet-5";
+    warnIfPremiumModel(env, "OPENROUTER_MODEL", model);
     return {
       provider: "openrouter",
       model,
@@ -159,9 +179,10 @@ function detectProvider(env: Record<string, string>): ProviderConfig {
 
   const allowAgentSdk = env["AGENTMEMORY_ALLOW_AGENT_SDK"] === "true";
   if (!allowAgentSdk) {
-    process.stderr.write(
+    writeProviderNoticeOnce(
       pc.dim(
-        "[agentmemory] No LLM provider key set — running zero-LLM (BM25 + on-device embeddings). " +
+        "[agentmemory] No LLM provider key set — running zero-LLM: no LLM compression or summaries; search uses BM25 plus any configured embedding provider. " +
+          "Set EMBEDDING_PROVIDER=local for on-device semantic embeddings if none is configured. " +
           "Set ANTHROPIC_API_KEY (or GEMINI/OPENAI/OPENROUTER/MINIMAX) in ~/.agentmemory/.env for LLM compression and summaries. " +
           "Agent-SDK fallback stays off by default to avoid a Stop-hook recursion loop; opt in with AGENTMEMORY_AUTO_COMPRESS=true + AGENTMEMORY_ALLOW_AGENT_SDK=true.\n",
       ),
@@ -173,7 +194,7 @@ function detectProvider(env: Record<string, string>): ProviderConfig {
     };
   }
 
-  process.stderr.write(
+  writeProviderNoticeOnce(
     "[agentmemory] WARNING: agent-sdk fallback enabled via AGENTMEMORY_ALLOW_AGENT_SDK=true. " +
       "This spawns @anthropic-ai/claude-agent-sdk child sessions that can trigger the Stop-hook " +
       "recursion loop. A SDK-child env marker is set to block re-entry, " +
@@ -181,7 +202,7 @@ function detectProvider(env: Record<string, string>): ProviderConfig {
   );
   return {
     provider: "agent-sdk",
-    model: "claude-sonnet-4-20250514",
+    model: "claude-sonnet-5",
     maxTokens,
   };
 }
@@ -199,19 +220,46 @@ export function loadConfig(): AgentMemoryConfig {
   const streamsPort =
     parseInt(env["III_STREAM_PORT"] || env["III_STREAMS_PORT"] || "", 10) ||
     restPort + 1;
+  const viewerPort =
+    parseInt(env["III_VIEWER_PORT"] || "", 10) || restPort + 2;
   const engineUrl =
     env["III_ENGINE_URL"] ||
     `ws://localhost:${
       parseInt(env["III_ENGINE_PORT"] || "", 10) || restPort + 46023
     }`;
 
+  const maxObservationsPerSession = safeParseInt(
+    env["MAX_OBS_PER_SESSION"],
+    500,
+  );
+  if (
+    !obsCapImportCeilingWarned &&
+    (maxObservationsPerSession === 0 ||
+      maxObservationsPerSession > MAX_IMPORT_OBS_PER_SESSION)
+  ) {
+    obsCapImportCeilingWarned = true;
+    const capDesc =
+      maxObservationsPerSession === 0
+        ? "uncapped (0)"
+        : String(maxObservationsPerSession);
+    process.stderr.write(
+      `[agentmemory] WARNING: MAX_OBS_PER_SESSION is ${capDesc}, above the ` +
+        `${MAX_IMPORT_OBS_PER_SESSION}-per-session import ceiling ` +
+        `(MAX_IMPORT_OBS_PER_SESSION). Sessions past that ceiling make every ` +
+        `mem::export -> mem::import restore fail wholesale. Keep ` +
+        `MAX_OBS_PER_SESSION at or below ${MAX_IMPORT_OBS_PER_SESSION} if you ` +
+        `rely on export/import backups.\n`,
+    );
+  }
+
   return {
     engineUrl,
     restPort,
     streamsPort,
+    viewerPort,
     provider,
     tokenBudget: safeParseInt(env["TOKEN_BUDGET"], 2000),
-    maxObservationsPerSession: safeParseInt(env["MAX_OBS_PER_SESSION"], 500),
+    maxObservationsPerSession,
     compressionModel: provider.model,
     dataDir: DATA_DIR,
   };
@@ -228,12 +276,65 @@ export function getEnvVar(key: string): string | undefined {
   return getMergedEnv()[key];
 }
 
+export function isSessionSweepEnabled(): boolean {
+  return getMergedEnv()["AGENTMEMORY_SESSION_SWEEP_ENABLED"] !== "false";
+}
+
+export function getSessionSweepStaleHours(): number {
+  const raw = getMergedEnv()["AGENTMEMORY_SESSION_SWEEP_STALE_HOURS"];
+  if (!raw || !/^\d+$/.test(raw.trim())) return 24;
+  const parsed = parseInt(raw.trim(), 10);
+  return parsed > 0 ? parsed : 24;
+}
+
+export function getFinalizeIdleMs(): number {
+  const raw = getMergedEnv()["AGENTMEMORY_FINALIZE_IDLE_MS"];
+  if (!raw || !/^\d+$/.test(raw.trim())) return 120000;
+  return parseInt(raw.trim(), 10);
+}
+
+export function isGraphCompactOnBootEnabled(): boolean {
+  return getMergedEnv()["AGENTMEMORY_GRAPH_COMPACT_ON_BOOT"] !== "false";
+}
+
 export function isDropStaleIndexEnabled(): boolean {
   return getMergedEnv()["AGENTMEMORY_DROP_STALE_INDEX"] === "true";
 }
 
-export function detectLlmProviderKind(): "llm" | "noop" {
-  const env = getMergedEnv();
+const VALID_STATE_BACKENDS = new Set(["file", "redis"]);
+
+export function getStateBackend(): "file" | "redis" {
+  const raw = (getMergedEnv()["AGENTMEMORY_STATE_BACKEND"] || "")
+    .trim()
+    .toLowerCase();
+  if (!raw) return "file";
+  if (!VALID_STATE_BACKENDS.has(raw)) {
+    throw new Error(
+      `AGENTMEMORY_STATE_BACKEND="${raw}" is not a recognized state backend. Use "file" (the default) or "redis", or unset it to keep the default file store.`,
+    );
+  }
+  return raw as "file" | "redis";
+}
+
+export function getRedisUrl(): string | undefined {
+  const value = getMergedEnv()["AGENTMEMORY_REDIS_URL"];
+  return hasRealValue(value) ? value.trim() : undefined;
+}
+
+export function getAuditRetentionMonths(): number {
+  return safeParseInt(getMergedEnv()["AGENTMEMORY_AUDIT_RETENTION_MONTHS"], 0);
+}
+
+export function getAuditMigrateMaxBytes(): number {
+  return safeParseInt(
+    getMergedEnv()["AGENTMEMORY_AUDIT_MIGRATE_MAX_BYTES"],
+    32 * 1024 * 1024,
+  );
+}
+
+export function detectLlmProviderKind(
+  env: Record<string, string | undefined> = getMergedEnv(),
+): "llm" | "noop" {
   if (
     hasRealValue(env["ANTHROPIC_API_KEY"]) ||
     hasRealValue(env["GEMINI_API_KEY"]) ||
@@ -241,11 +342,25 @@ export function detectLlmProviderKind(): "llm" | "noop" {
     hasRealValue(env["OPENROUTER_API_KEY"]) ||
     hasRealValue(env["MINIMAX_API_KEY"]) ||
     (hasRealValue(env["OPENAI_API_KEY"]) &&
-      env["OPENAI_API_KEY_FOR_LLM"] !== "false")
+      env["OPENAI_API_KEY_FOR_LLM"] !== "false") ||
+    env["AGENTMEMORY_ALLOW_AGENT_SDK"] === "true"
   ) {
     return "llm";
   }
   return "noop";
+}
+
+export function describeLlmRoute(provider: ProviderConfig): string | null {
+  if (provider.provider === "noop") return null;
+  const parts = [provider.provider, provider.model];
+  if (provider.baseURL) {
+    try {
+      parts.push(new URL(provider.baseURL).host);
+    } catch {
+      parts.push("custom base URL");
+    }
+  }
+  return parts.join(" · ");
 }
 
 export function loadEmbeddingConfig(): EmbeddingConfig {
@@ -271,7 +386,7 @@ export function detectEmbeddingProvider(
   if (forced) return forced;
 
   if (source["GEMINI_API_KEY"]) return "gemini";
-  if (source["OPENAI_API_KEY"]) return "openai";
+  if (source["OPENAI_API_KEY"] || source["OPENAI_EMBEDDING_API_KEY"]) return "openai";
   if (source["VOYAGE_API_KEY"]) return "voyage";
   if (source["COHERE_API_KEY"]) return "cohere";
   if (source["OPENROUTER_API_KEY"]) return "openrouter";
@@ -396,30 +511,33 @@ export function getFollowupWindowSeconds(): number {
   );
 }
 
+const VIEWER_STREAM_MAX_DEFAULT = 500;
+const VIEWER_STREAM_MAX_FLOOR = 200;
+
+function parseExactInt(value: string | undefined, fallback: number): number {
+  if (!value) return fallback;
+  const trimmed = value.trim();
+  if (!/^-?\d+$/.test(trimmed)) return fallback;
+  const parsed = Number(trimmed);
+  return Number.isSafeInteger(parsed) ? parsed : fallback;
+}
+
+export function getViewerStreamMax(): number {
+  const parsed = parseExactInt(
+    getMergedEnv()["AGENTMEMORY_VIEWER_STREAM_MAX"],
+    VIEWER_STREAM_MAX_DEFAULT,
+  );
+  if (parsed < 0) return VIEWER_STREAM_MAX_DEFAULT;
+  return Math.max(parsed, VIEWER_STREAM_MAX_FLOOR);
+}
+
 export function isConsolidationEnabled(): boolean {
   const env = getMergedEnv();
   const explicit = env["CONSOLIDATION_ENABLED"];
   if (explicit === "false" || explicit === "0") return false;
   if (explicit === "true" || explicit === "1") return true;
-  return hasLLMProviderConfigured(env);
-}
-
-function hasLLMProviderConfigured(env: Record<string, string | undefined>): boolean {
-  const provider = (env["AGENTMEMORY_PROVIDER"] || "").toLowerCase();
-  if (provider === "noop") return false;
-  const openaiKeyForLlm =
-    env["OPENAI_API_KEY"] &&
-    (env["OPENAI_API_KEY_FOR_LLM"] || "").toLowerCase() !== "false";
-  return Boolean(
-    env["ANTHROPIC_API_KEY"] ||
-      openaiKeyForLlm ||
-      env["OPENROUTER_API_KEY"] ||
-      env["GEMINI_API_KEY"] ||
-      env["GOOGLE_API_KEY"] ||
-      env["MINIMAX_API_KEY"] ||
-      env["OPENAI_BASE_URL"] ||
-      provider === "agent-sdk",
-  );
+  if ((env["AGENTMEMORY_PROVIDER"] || "").toLowerCase() === "noop") return false;
+  return detectLlmProviderKind(env) === "llm";
 }
 
 // Per-observation LLM compression is OFF by default as of 0.8.8.
@@ -445,6 +563,13 @@ export function isContextInjectionEnabled(): boolean {
   return getMergedEnv()["AGENTMEMORY_INJECT_CONTEXT"] === "true";
 }
 
+export const CONSOLIDATION_INTERVAL_DEFAULT_MS = 7200000;
+
+export function getConsolidationIntervalMs(): number {
+  const raw = parseInt(process.env.CONSOLIDATION_INTERVAL_MS || String(CONSOLIDATION_INTERVAL_DEFAULT_MS), 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : CONSOLIDATION_INTERVAL_DEFAULT_MS;
+}
+
 export function getConsolidationDecayDays(): number {
   return safeParseInt(getMergedEnv()["CONSOLIDATION_DECAY_DAYS"], 30);
 }
@@ -462,6 +587,39 @@ export function getConsolidationCooldownMs(): number {
     CONSOLIDATION_COOLDOWN_DEFAULT_MS,
   );
   return raw >= 0 ? raw : CONSOLIDATION_COOLDOWN_DEFAULT_MS;
+}
+
+export const INDEX_SAVE_INTERVAL_DEFAULT_MS = 600_000;
+
+export function getIndexSaveIntervalMs(): number {
+  const raw = safeParseInt(
+    getMergedEnv()["AGENTMEMORY_INDEX_SAVE_INTERVAL_MS"],
+    INDEX_SAVE_INTERVAL_DEFAULT_MS,
+  );
+  return raw > 0 ? raw : INDEX_SAVE_INTERVAL_DEFAULT_MS;
+}
+
+export function getStateSaveIntervalMs(): number | undefined {
+  const raw = safeParseInt(getMergedEnv()["AGENTMEMORY_STATE_SAVE_INTERVAL_MS"], 0);
+  return raw > 0 ? raw : undefined;
+}
+
+export const VECTOR_BUCKET_SIZE_DEFAULT = 500;
+
+export function getVectorBucketSize(): number {
+  const raw = safeParseInt(getMergedEnv()["AGENTMEMORY_VECTOR_BUCKET_SIZE"], VECTOR_BUCKET_SIZE_DEFAULT);
+  return raw > 0 ? raw : VECTOR_BUCKET_SIZE_DEFAULT;
+}
+
+export const VECTOR_BACKFILL_MAX_DEFAULT = 500;
+
+export function getVectorBackfillMax(): number {
+  const raw = safeParseInt(getMergedEnv()["AGENTMEMORY_VECTOR_BACKFILL_MAX"], VECTOR_BACKFILL_MAX_DEFAULT);
+  return raw > 0 ? raw : VECTOR_BACKFILL_MAX_DEFAULT;
+}
+
+export function isVectorBackfillAllEnabled(): boolean {
+  return getMergedEnv()["AGENTMEMORY_VECTOR_BACKFILL"] === "all";
 }
 
 export function isStandaloneMcp(): boolean {

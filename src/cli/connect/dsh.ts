@@ -1,193 +1,181 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, dirname } from "node:path";
+import { dirname, join } from "node:path";
 import * as p from "@clack/prompts";
+import { isMap, isSeq, parseDocument } from "yaml";
 import type { ConnectAdapter, ConnectOptions, ConnectResult } from "./types.js";
-import { backupFile, logAlreadyWired, logBackup, logInstalled } from "./util.js";
+import {
+  backupFile,
+  logAlreadyWired,
+  logBackup,
+  logInstalled,
+  readJsonSafe,
+  writeJsonAtomic,
+  writeTextAtomic,
+} from "./util.js";
+import {
+  buildMergedHooks,
+  findPluginRoot,
+  type HookManifest,
+} from "./codex-hooks.js";
 
-const NL = "\n";
-
-// DeepSeek Harness (dsh) adapter.
-//
-// DSH has no native hooks; it consumes agentmemory through its MCP client
-// plugin (@deepseek-ai/dsh-mcp-client, stdio transport) and loads per-session
-// instructions from $DSH_HOME/AGENTS.md. This adapter:
-//   1. appends the mcp-agentmemory entry to the profile's cordis.patch.yml
-//      (HMR hot-reloads the config, no restart needed),
-//   2. writes ~/.dsh/skills/agentmemory-sync/SKILL.md so the skill registry
-//      (scans <dshHome>/skills) exposes a memory-sync skill,
-//   3. (runAdapter) writes the memory-usage guideline block into
-//      ~/.dsh/AGENTS.md via guidelines.ts.
-// The L3 cordis plugin (@agentmemory/dsh) is installed separately:
-//   dsh plugin --profile web add @agentmemory/dsh
+// Rows land in the home-level cordis.patch.yml, the patch layer every
+// Harness profile loads; the hooks row reuses the bundled Claude Code
+// hook scripts through Harness's own bridge plugin.
 
 function dshHome(): string {
-  // Aligns with guidelines.ts (which uses os.homedir() for the dsh guideline
-  // target); DSH_HOME is an explicit override for unusual setups.
-  return process.env.DSH_HOME || join(homedir(), ".dsh");
+  return process.env["DSH_HOME"] || join(homedir(), ".dsh");
 }
 
-function profilesDir(): string {
-  return join(dshHome(), "profiles");
+// Harness evaluates !!js before scrubbing secrets from the MCP child env.
+const MCP_BLOCK = `- insert:
+    - id: agentmemory
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        serverName: agentmemory
+        command: npx
+        args: ['-y', '@agentmemory/mcp']
+        env:
+          AGENTMEMORY_URL: !!js process.env.AGENTMEMORY_URL || 'http://localhost:3111'
+          AGENTMEMORY_SECRET: !!js process.env.AGENTMEMORY_SECRET || ''
+`;
+
+const MCP_MARKER = "serverName: agentmemory";
+const HOOKS_MARKER = "id: agentmemory-hooks";
+
+function hooksBlock(hooksConfigPath: string): string {
+  return `- insert:
+    - id: agentmemory-hooks
+      name: '@deepseek-ai/dsh-hooks-claude-code'
+      config:
+        configPath: ${JSON.stringify(hooksConfigPath)}
+`;
 }
 
-function defaultProfile(): string {
-  return process.env["AGENTMEMORY_DSH_PROFILE"]?.trim() || "web";
-}
-
-function profileDir(profile: string): string {
-  return join(profilesDir(), profile);
-}
-
-function patchPath(profile: string): string {
-  return join(profileDir(profile), "cordis.patch.yml");
-}
-
-const MCP_ENTRY_MARKER = "# ── agentmemory (installed by 'agentmemory connect dsh') ──";
-
-// Remove the previously installed agentmemory block (marker comment + its
-// insert entry) so --force re-installs cleanly instead of appending a
-// duplicate. Also removes a user-configured `- id: mcp-agentmemory` entry
-// that lacks the marker, so --force never leaves two entries with the same
-// server id. Content outside the removed spans (user's own entries) survives.
-function stripInstalledBlock(content: string): string {
-  let out = content;
-  const idx = out.indexOf(MCP_ENTRY_MARKER);
-  if (idx !== -1) {
-    const lineStart = out.lastIndexOf("\n", idx) + 1;
-    const tail = out.slice(lineStart);
-    // The block's own "- insert:" line, then any following top-level entry.
-    const first = tail.search(/^- /m);
-    const rest = first === -1 ? "" : tail.slice(first + 1);
-    const second = rest.search(/^- /m);
-    const end = second === -1 ? out.length : lineStart + first + 1 + second;
-    out = out.slice(0, lineStart) + out.slice(end);
+function parsePatch(content: string) {
+  const doc = parseDocument(content);
+  if (doc.contents === null) doc.contents = doc.createNode([]);
+  if (doc.errors.length || !isSeq(doc.contents)) {
+    throw new Error("Cannot update dsh cordis.patch.yml: expected a valid YAML sequence.");
   }
-  const entry = out.indexOf("- id: mcp-agentmemory");
-  if (entry !== -1) {
-    const lineStart = out.lastIndexOf("\n", entry) + 1;
-    const insertPos = out.lastIndexOf("\n- insert:", lineStart);
-    const blockStart = insertPos === -1 ? lineStart : insertPos + 1;
-    const tail = out.slice(lineStart);
-    const nextTop = tail.search(/^- /m);
-    const end = nextTop === -1 ? out.length : lineStart + nextTop;
-    out = out.slice(0, blockStart) + out.slice(end);
-  }
-  return out;
+  return { doc, operations: doc.contents };
 }
 
-const MCP_ENTRY = [
-  "# ── agentmemory (installed by 'agentmemory connect dsh') ──",
-  "- insert:",
-  "    - id: mcp-agentmemory",
-  "      name: '@deepseek-ai/dsh-mcp-client'",
-  "      config:",
-  "        transport: stdio",
-  "        serverName: agentmemory",
-  "        command: npx",
-  "        args: ['-y', '@agentmemory/mcp']",
-  "        env:",
-  "          AGENTMEMORY_URL: http://localhost:3111",
-  "          # AGENTMEMORY_SECRET: '<match the daemon .env>'",
-  "        toolCallTimeoutMs: 60000",
-  "        failOnStartupError: false",
-  "",
-].join(NL);
+function isManaged(entry: unknown, marker: string): boolean {
+  if (!isMap(entry)) return false;
+  return marker === MCP_MARKER
+    ? entry.get("name") === "@deepseek-ai/dsh-mcp-client" && entry.getIn(["config", "serverName"]) === "agentmemory"
+    : entry.get("name") === "@deepseek-ai/dsh-hooks-claude-code" && entry.get("id") === "agentmemory-hooks";
+}
 
-const SKILL_MD = [
-  "---",
-  "name: agentmemory-sync",
-  "description: Sync with the agentmemory long-term memory at task start/end. Use when starting a new task, recalling past work, finishing a task, needing cross-session context, or reviewing what was done.",
-  "---",
-  "# agentmemory memory sync",
-  "",
-  "1. At task start: call mcp__agentmemory__memory_recall with the task keywords + project path, format=compact, to bring relevant history into context.",
-  "2. During the task: when you learn something durable (decision/fix/preference/convention), call memory_save immediately (type=fact, concepts: 2-5 keywords).",
-  "3. At task end: call memory_save with a short outcome summary (type=insight), and confirm the session is registered via memory_sessions.",
-  "4. For large handoffs: call memory_smart_search with expandIds for graph-diffusion recall, or use memory_lesson_save/memory_lesson_recall for lessons.",
-  "",
-].join(NL);
+function hasBlock(content: string, marker: string): boolean {
+  return parsePatch(content).operations.items.some((operation) => {
+    const entries = isMap(operation) ? operation.get("insert", true) : null;
+    return isSeq(entries) && entries.items.some((entry) => isManaged(entry, marker));
+  });
+}
+
+function upsertBlock(content: string, marker: string, block: string): string {
+  const { doc, operations } = parsePatch(content);
+  const addition = parsePatch(block).operations;
+  const replacement = addition.getIn([0, "insert", 0], true);
+  let replaced = false;
+  for (let i = 0; i < operations.items.length; i++) {
+    const operation = operations.items[i];
+    if (!isMap(operation)) continue;
+    const entries = operation.get("insert", true);
+    if (!isSeq(entries)) continue;
+    let removed = false;
+    for (let j = 0; j < entries.items.length; j++) {
+      if (!isManaged(entries.items[j], marker)) continue;
+      if (!replaced) {
+        entries.set(j, replacement);
+        replaced = true;
+      } else {
+        entries.delete(j--);
+        removed = true;
+      }
+    }
+    if (removed && entries.items.length === 0) operations.delete(i--);
+  }
+  if (!replaced) operations.items.push(...addition.items);
+  operations.flow = false;
+  return doc.toString();
+}
+
+function installHooksFile(home: string): string {
+  const hooksPath = join(home, "agentmemory.hooks.json");
+  const pluginRoot = findPluginRoot();
+  const existing = readJsonSafe<HookManifest>(hooksPath);
+  const merged = buildMergedHooks(existing, pluginRoot, "hooks.codex.json");
+  writeJsonAtomic(hooksPath, merged);
+  return hooksPath;
+}
 
 export const adapter: ConnectAdapter = {
   name: "dsh",
-  displayName: "DeepSeek Harness (dsh)",
-  category: "mcp",
-  docs: "https://github.com/deepseek-ai/deepseek-harness",
+  displayName: "DeepSeek Harness",
+  docs: "https://github.com/rohitg00/agentmemory/blob/main/docs/dsh.md",
   protocolNote:
-    "Using MCP via the profile's cordis.patch.yml (@deepseek-ai/dsh-mcp-client, stdio). For full auto-capture, also install the cordis plugin: dsh plugin --profile <profile> add @agentmemory/dsh",
-
+    "→ Using MCP via $DSH_HOME/cordis.patch.yml (the home-level patch layer every profile loads). Tools appear as mcp__agentmemory__*. Pass --with-hooks to also wire auto-capture through Harness's Claude Code hook bridge.",
+  category: "native",
   detect(): boolean {
     return existsSync(dshHome());
   },
-
   async install(opts: ConnectOptions): Promise<ConnectResult> {
-    const profile = defaultProfile();
-    const patch = patchPath(profile);
-    const profileExists = existsSync(profileDir(profile));
+    const home = dshHome();
+    const configPath = join(home, "cordis.patch.yml");
+    const existing = existsSync(configPath)
+      ? readFileSync(configPath, "utf-8")
+      : "";
 
-    if (!profileExists) {
-      p.log.warn(
-        "dsh profile '" + profile + "' not found under " + profilesDir() + ". Set AGENTMEMORY_DSH_PROFILE to a profile that exists.",
-      );
-      return { kind: "stub", reason: "profile '" + profile + "' not found (set AGENTMEMORY_DSH_PROFILE)" };
+    const wantHooks = opts.withHooks === true;
+    if (wantHooks) {
+      p.log.info(`Hooks require @deepseek-ai/dsh-hooks-claude-code and @deepseek-ai/dsh-hook-protocol in each profile, plus locally discoverable credentials. Setup: ${this.docs}`);
     }
+    const hasMcp = hasBlock(existing, MCP_MARKER);
+    const hasHooks = hasBlock(existing, HOOKS_MARKER);
 
-    const existing = existsSync(patch) ? readFileSync(patch, "utf8") : "";
-    const alreadyHas = existing.includes("- id: mcp-agentmemory");
-    const ensureSkill = (force: boolean): void => {
-      // Skill for the DSH skill registry (<dshHome>/skills). Never clobber a
-      // user-customized copy unless --force (and keep a backup when replacing).
-      const skillDir = join(dshHome(), "skills", "agentmemory-sync");
-      const skillPath = join(skillDir, "SKILL.md");
-      if (existsSync(skillPath) && !force) {
-        p.log.info("  skill exists (skipped; --force to overwrite)");
-        return;
-      }
-      if (existsSync(skillPath)) {
-        const skillBackup = backupFile(skillPath, this.name, "md");
-        logBackup(skillBackup);
-      }
-      mkdirSync(skillDir, { recursive: true });
-      writeFileSync(skillPath, SKILL_MD, "utf8");
-    };
-
-    if (alreadyHas && !opts.force) {
-      logAlreadyWired(this.displayName, patch);
-      if (!opts.dryRun) ensureSkill(false);
-      return { kind: "already-wired", mutatedPath: patch };
+    if (hasMcp && (!wantHooks || hasHooks) && !opts.force) {
+      logAlreadyWired(this.displayName, configPath);
+      return { kind: "already-wired", mutatedPath: configPath };
     }
 
     if (opts.dryRun) {
-      p.log.info("[dry-run] Would " + (alreadyHas ? "replace" : "append") + " mcp-agentmemory entry in " + patch);
-      return { kind: "installed", mutatedPath: patch };
+      p.log.info(
+        `[dry-run] Would append the agentmemory mcp-client row${wantHooks ? " and the hooks-claude-code row" : ""} to ${configPath}`,
+      );
+      return { kind: "installed", mutatedPath: configPath };
     }
 
     let backupPath: string | undefined;
-    if (existsSync(patch)) {
-      backupPath = backupFile(patch, this.name, "yml");
+    if (existsSync(configPath)) {
+      backupPath = backupFile(configPath, this.name, "yml");
       logBackup(backupPath);
     } else {
-      mkdirSync(dirname(patch), { recursive: true });
+      mkdirSync(dirname(configPath), { recursive: true });
     }
 
-    // Append, never rewrite: the patch layer carries the user's own
-    // commented entries and other MCP servers. --force replaces only the
-    // previously installed agentmemory block.
-    const base = alreadyHas ? stripInstalledBlock(existing) : existing;
-    const joiner = base.length === 0 || base.endsWith("\n") ? "" : "\n";
-    const next = base + joiner + NL + MCP_ENTRY;
-    writeFileSync(patch, next, "utf8");
+    let next = hasMcp && !opts.force ? existing : upsertBlock(existing, MCP_MARKER, MCP_BLOCK);
 
-    ensureSkill(opts.force);
+    if (wantHooks && (!hasHooks || opts.force)) {
+      const hooksPath = installHooksFile(home);
+      next = upsertBlock(next, HOOKS_MARKER, hooksBlock(hooksPath));
+      p.log.info(`Hook manifest: ${hooksPath}`);
+    }
 
-    logInstalled(this.displayName, patch);
-    p.log.message(
-      "  full auto-capture: dsh plugin --profile " + profile + " add @agentmemory/dsh",
-    );
-    return {
-      kind: "installed",
-      mutatedPath: patch,
-      ...(backupPath !== undefined && { backupPath }),
-    };
+    writeTextAtomic(configPath, next);
+
+    const written = readFileSync(configPath, "utf-8");
+    if (!hasBlock(written, MCP_MARKER) || (wantHooks && !hasBlock(written, HOOKS_MARKER))) {
+      p.log.error(
+        `Verification failed: ${configPath} did not contain the agentmemory rows after write.`,
+      );
+      return { kind: "skipped", reason: "verification-failed" };
+    }
+
+    logInstalled(this.displayName, configPath);
+    return { kind: "installed", mutatedPath: configPath, backupPath };
   },
 };

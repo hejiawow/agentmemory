@@ -18,7 +18,7 @@ Prerequisite: the agentmemory daemon is running (`npx @agentmemory/agentmemory`,
 
 ### 1. MCP bridge (tools, optional but recommended)
 
-Append the `mcp-agentmemory` entry from `install/cordis.patch.yml` to `~/.dsh/profiles/<profile>/cordis.patch.yml` (HMR hot-reloads it — no restart). dsh agents then get `mcp__agentmemory__*` tools.
+Run `agentmemory connect dsh` to configure the MCP bridge in `$DSH_HOME/cordis.patch.yml` (default `~/.dsh`), shared by every profile. Add `--guidelines` for the memory guidance. Do not add a second MCP entry in a profile; keep any existing customized entry in one location.
 
 ### 2. Plugin (auto-capture)
 
